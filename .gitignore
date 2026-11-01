@@ -1,0 +1,46 @@
+# ============ Keil MDK 构建产物 ============
+keil/Objects/
+keil/Listings/
+keil/*.map
+keil/*.uvguix.*
+keil/*.dep
+keil/*.bak
+keil/*.__i
+keil/*.crf
+keil/*.lnp
+keil/*.iex
+
+# ============ IAR 构建产物 ============
+iar/Debug/
+iar/Release/
+iar/settings/
+*.ewt
+
+# ============ GCC / tiarmclang 构建产物 ============
+gcc/build/
+ticlang/**/Debug/
+ticlang/**/Release/
+build/
+
+# ============ 通用编译中间文件 ============
+*.o
+*.d
+*.axf
+*.hex
+*.bin
+*.out
+*.elf
+*.lst
+*.su
+*.db
+
+# ============ 运行/调试产物 ============
+debug.log
+串口收到数据
+trace_*.csv
+
+# ============ 编辑器 / 系统 ============
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

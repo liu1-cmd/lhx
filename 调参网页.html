@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>循迹小车 PID 调参台</title>
+<style>
+  :root{
+    --bg:#12151a; --panel:#1b2027; --panel2:#232a33; --line:#2f3945;
+    --text:#d7dee6; --dim:#8a97a6; --accent:#4da3ff; --green:#3ecf8e;
+    --red:#ff6b6b; --yellow:#ffc94d;
+  }
+  *{box-sizing:border-box; margin:0; padding:0;}
+  body{background:var(--bg); color:var(--text); font:14px/1.5 "Microsoft YaHei",system-ui,sans-serif; padding:14px;}
+  h1{font-size:17px; margin-bottom:10px; font-weight:600;}
+  .topbar{display:flex; flex-wrap:wrap; gap:10px; align-items:center; background:var(--panel);
+          border:1px solid var(--line); border-radius:8px; padding:10px 12px; margin-bottom:12px;}
+  button,select,input[type=text]{background:var(--panel2); color:var(--text); border:1px solid var(--line);
+          border-radius:6px; padding:6px 12px; font-size:14px; cursor:pointer;}
+  button:hover{border-color:var(--accent);}
+  button.primary{background:var(--accent); color:#0c1016; border-color:var(--accent); font-weight:600;}
+  button.warn{background:var(--red); color:#fff; border-color:var(--red);}
+  .chip{background:var(--panel2); border:1px solid var(--line); border-radius:6px; padding:4px 10px; font-size:13px;}
+  .chip b{color:var(--accent); font-variant-numeric:tabular-nums;}
+  .chip.ok b{color:var(--green);} .chip.bad b{color:var(--red);}
+  .layout{display:grid; grid-template-columns:1fr 320px; gap:12px;}
+  @media(max-width:980px){.layout{grid-template-columns:1fr;}}
+  .card{background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px;}
+  .card h2{font-size:14px; color:var(--dim); margin-bottom:8px; font-weight:600;}
+  #wave{width:100%; height:340px; display:block; background:#0d1014; border-radius:6px;}
+  .chbtns{display:flex; flex-wrap:wrap; gap:6px; margin-bottom:8px;}
+  .chbtns button.on{background:var(--accent); color:#0c1016; border-color:var(--accent); font-weight:600;}
+  .gain{margin-bottom:14px;}
+  .gain .row{display:flex; align-items:center; gap:8px; margin-top:4px;}
+  .gain label{width:34px; font-weight:700; color:var(--yellow);}
+  .gain input[type=range]{flex:1; accent-color:var(--accent);}
+  .gain input[type=number]{width:76px; background:var(--panel2); color:var(--text);
+          border:1px solid var(--line); border-radius:6px; padding:4px 6px;}
+  .gain .dev{font-size:12px; color:var(--dim);}
+  .gain button{padding:4px 10px;}
+  #log{height:130px; overflow-y:auto; background:#0d1014; border:1px solid var(--line);
+       border-radius:6px; padding:6px 8px; font:12px/1.6 Consolas,monospace; color:var(--dim);}
+  #log .ack{color:var(--green);} #log .err{color:var(--red);}
+  .hint{font-size:12px; color:var(--dim); margin-top:8px;}
+  .manual{display:flex; gap:6px; margin-top:10px;}
+  .manual input{flex:1;}
+  .rawbar{display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-top:8px;}
+  .rawtag{font-size:12px; color:var(--dim);}
+  #raw{background:#0d1014; border:1px solid var(--line); border-radius:6px; margin-top:6px;
+       padding:6px 8px; font:12px/1.6 Consolas,monospace; color:var(--dim);
+       word-break:break-all; min-height:38px; max-height:76px; overflow-y:auto;}
+  #raw b{color:var(--yellow);}
+</style>
+</head>
+<body>
+<h1>循迹小车 PID 调参台（Web Serial · 替代 VOFA+）</h1>
+
+<div class="topbar">
+  <select id="baud">
+    <option value="115200" selected>115200</option>
+    <option value="57600">57600</option>
+    <option value="9600">9600</option>
+  </select>
+  <button id="btnConn" class="primary">连接串口</button>
+  <button id="btnPause">暂停波形</button>
+  <button id="btnRec">● 录制数据</button>
+  <span class="chip" id="cFrame">帧数 <b>0</b></span>
+  <span class="chip" id="cFps">速率 <b>0</b> fps</span>
+  <span class="chip" id="cSkip">跳过文本行 <b>0</b></span>
+  <span class="chip" id="cBytes">接收字节 <b>0</b></span>
+  <span class="chip" id="cState">状态 <b>--</b></span>
+  <span class="chip" id="cErr">误差 <b>--</b></span>
+</div>
+
+<div class="layout">
+  <div class="card">
+    <h2>实时波形（遥测帧：err,P,I,D,dutyA,dutyB,state,kp,ki,kd，缩放×10 的通道已还原）</h2>
+    <div class="chbtns" id="chBtns"></div>
+    <canvas id="wave"></canvas>
+    <div class="rawbar">
+      <button id="btnInject">注入测试帧（验证网页）</button>
+      <span class="rawtag">原始字节 HEX（最近 96 字节）→ 有字节说明链路通，没字节说明串口上真的没数据</span>
+    </div>
+    <div id="raw">（尚未收到任何字节）</div>
+    <div class="hint">调参主看 <b>误差 err</b> 曲线：好的整定 = 过弯后误差快速回零、不振荡、不长期贴边。
+      振荡→降 kp / 升 kd；回零慢→升 kp；稳态偏差→升 ki；D 毛刺大→降 kd。</div>
+  </div>
+
+  <div>
+    <div class="card" style="margin-bottom:12px;">
+      <h2>PID 增益（下发格式 kp=数值，固件范围 0~1000）</h2>
+      <div class="gain" data-k="kp" data-min="0" data-max="400" data-step="0.5" data-def="180">
+        <div class="row"><label>Kp</label>
+          <input type="range"><input type="number">
+          <button>发送</button></div>
+        <div class="dev">车端当前值：--</div>
+      </div>
+      <div class="gain" data-k="ki" data-min="0" data-max="50" data-step="0.05" data-def="0">
+        <div class="row"><label>Ki</label>
+          <input type="range"><input type="number">
+          <button>发送</button></div>
+        <div class="dev">车端当前值：--</div>
+      </div>
+      <div class="gain" data-k="kd" data-min="0" data-max="10" data-step="0.05" data-def="0.8">
+        <div class="row"><label>Kd</label>
+          <input type="range"><input type="number">
+          <button>发送</button></div>
+        <div class="dev">车端当前值：--</div>
+      </div>
+      <div class="manual">
+        <input type="text" id="cmdIn" placeholder="手动命令，如 echo=1">
+        <button id="btnCmd">发送</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>文本行日志（ACK / ERR / 杂散数据）</h2>
+      <div id="log"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+/* ================= 通道定义 ================= */
+const CH = [
+  {name:"误差 err", idx:0, sc:1},
+  {name:"P",        idx:1, sc:0.1},
+  {name:"滤波误差", idx:2, sc:0.1},
+  {name:"D",        idx:3, sc:0.1},
+  {name:"dutyA",    idx:4, sc:1},
+  {name:"dutyB",    idx:5, sc:1},
+  {name:"state",    idx:6, sc:1},
+  {name:"kp",       idx:7, sc:0.1},
+  {name:"ki",       idx:8, sc:0.1},
+  {name:"kd",       idx:9, sc:0.1},
+  {name:"亮灯位掩码", idx:10, sc:1},
+];
+let curCh = 0;
+
+/* ================= 环形缓冲 ================= */
+const N = 1200;                       // 20fps 时约 60 秒
+const buf = Array.from({length:11}, () => new Float64Array(N));
+let head = 0, count = 0;
+let frameTotal = 0, skipTotal = 0;
+let lastTs = 0, fps = 0, fpsCount = 0;
+
+/* ================= 录制与导出 ================= */
+/* 蓝牙口被网页独占、脚本打不开，所以录帧放在网页侧：
+ * 点"录制"跑圈，点"停止并导出"下载 CSV，把文件放进工程目录即可离线分析。 */
+let recOn = false, recBuf = [];
+function stopRec(){
+  recOn = false;
+  el("btnRec").textContent = "● 录制数据";
+  if (!recBuf.length) { addLog("录制为空，未导出"); return; }
+  const header = "t_ms,err,P,filt_x10,D,dutyA,dutyB,state,kp_x10,ki_x10,kd_x10,line_mask";
+  const blob = new Blob([header + "\n" + recBuf.join("\n") + "\n"], { type: "text/csv" });
+  const a = document.createElement("a");
+  const d = new Date();
+  a.href = URL.createObjectURL(blob);
+  a.download = "trace_" + d.toTimeString().slice(0, 8).replace(/:/g, "") + ".csv";
+  a.click();
+  URL.revokeObjectURL(a.href);
+  addLog("已导出 " + recBuf.length + " 帧");
+  recBuf = [];
+}
+el("btnRec").onclick = () => {
+  if (recOn) { stopRec(); return; }
+  recOn = true; recBuf = [];
+  el("btnRec").textContent = "■ 停止并导出";
+};
+
+/* ================= 原始字节监视 ================= */
+/* 作用：把"网页没数据"拆成两种完全不同的故障——
+ *   接收字节 = 0  → 串口上根本没有字节（埠选错 / 线接反 / 波特率不符 / 固件没发）
+ *   接收字节 > 0  → 字节到了但格式不对（看 HEX 面板到底收到什么）
+ * 之前只统计"帧数"时这两种情况长得一模一样，所以总被误判成网页解析问题。 */
+let rxBytes = 0;
+let rxRing = [];
+let rawDirty = false;
+function noteRx(bytes){
+  rxBytes += bytes.length;
+  for (let i = 0; i < bytes.length; i++) rxRing.push(bytes[i]);
+  if (rxRing.length > 96) rxRing = rxRing.slice(rxRing.length - 96);
+  rawDirty = true;
+  el("cBytes").querySelector("b").textContent = rxBytes;
+}
+function renderRaw(){
+  const box = el("raw");
+  if (!rxRing.length) { box.textContent = "（尚未收到任何字节）"; return; }
+  const hex = rxRing.map(b => b.toString(16).padStart(2, "0")).join(" ");
+  const txt = rxRing.map(b => (b >= 0x20 && b <= 0x7E) ? String.fromCharCode(b) : ".").join("");
+  box.innerHTML = "";
+  const a = document.createElement("div"); a.textContent = hex;
+  const b = document.createElement("div"); b.textContent = txt;
+  b.style.color = "#5d6b7a";
+  box.appendChild(a); box.appendChild(b);
+}
+setInterval(() => { if (rawDirty) { rawDirty = false; renderRaw(); } }, 250);
+
+/* ================= 解析：只认 11 段纯数字行 ================= */
+/* 这是"收不到实时数据"的关键修复：ACK:/ERR:/kp: 等文本行不再进入波形流 */
+const NUM_LINE = /^-?\d+(?:\s*,\s*-?\d+){10}$/;
+let rxTail = "";
+function feedText(text){
+  rxTail += text;
+  let i;
+  while ((i = rxTail.search(/[\r\n]/)) >= 0) {
+    const line = rxTail.slice(0, i).trim();
+    rxTail = rxTail.slice(i + 1);
+    if (!line) continue;
+    if (NUM_LINE.test(line)) {
+      const v = line.split(",").map(s => parseInt(s, 10) || 0);
+      pushFrame(v);
+    } else {
+      skipTotal++;
+      addLog(line);
+      el("cSkip").querySelector("b").textContent = skipTotal;
+    }
+  }
+}
+function pushFrame(v){
+  if (recOn) {
+    recBuf.push(Date.now() + "," + v.join(","));
+    if (recBuf.length >= 30000) stopRec();   /* 上限 300s，防止内存爆 */
+  }
+  for (let c = 0; c < 11; c++) buf[c][head] = v[c] * CH_find(c).sc;
+  head = (head + 1) % N;
+  if (count < N) count++;
+  frameTotal++;
+  /* fps = 最近一个完整秒窗口内的实际帧数，避免"间隔倒数"式低估 */
+  fpsCount++;
+  const now = performance.now();
+  if (!lastTs) lastTs = now;
+  else if (now - lastTs >= 1000) {
+    fps = fpsCount * 1000 / (now - lastTs);
+    fpsCount = 0; lastTs = now;
+  }
+  el("cFrame").querySelector("b").textContent = frameTotal;
+  el("cFps").querySelector("b").textContent = fps.toFixed(1);
+  /* ch6：0=自动循迹 1=原地找线 2=蓝牙遥控（固件 mode=1 后应变成"蓝牙遥控"） */
+  el("cState").querySelector("b").textContent =
+    v[6] === 2 ? "蓝牙遥控" : (v[6] === 1 ? "原地找线" : "循迹");
+  el("cErr").querySelector("b").textContent = v[0];
+  /* 车端真实增益回显 */
+  setDevGain("kp", v[7] * 0.1); setDevGain("ki", v[8] * 0.1); setDevGain("kd", v[9] * 0.1);
+}
+function CH_find(idx){ return CH.find(c => c.idx === idx); }
+
+/* ================= 波形绘制 ================= */
+const cv = el("wave"), ctx = cv.getContext("2d");
+let paused = false;
+function fitCanvas(){
+  const r = cv.getBoundingClientRect(), dpr = devicePixelRatio || 1;
+  const nw = Math.round(r.width * dpr), nh = Math.round(r.height * dpr);
+  if (cv.width !== nw || cv.height !== nh) {   /* 取整比较，避免小数宽度每帧重置画布 */
+    cv.width = nw; cv.height = nh;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  return {w: r.width, h: r.height};
+}
+function draw(){
+  requestAnimationFrame(draw);
+  if (paused) { fitCanvas(); return; }
+  const {w, h} = fitCanvas();
+  ctx.clearRect(0, 0, w, h);
+  const data = buf[CH[curCh].idx];
+  let mn = Infinity, mx = -Infinity;
+  for (let i = 0; i < count; i++) { const v = data[i]; if (v < mn) mn = v; if (v > mx) mx = v; }
+  if (count === 0) { mn = -1; mx = 1; }
+  if (mx - mn < 1e-6) { mn -= 1; mx += 1; }
+  mn -= (mx - mn) * 0.08; mx += (mx - mn) * 0.08;
+  const Y = v => h - (v - mn) / (mx - mn) * h;
+  /* 网格 + 零线 */
+  ctx.strokeStyle = "#222a33"; ctx.lineWidth = 1;
+  for (let g = 1; g < 5; g++) { const y = h * g / 5; ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke(); }
+  if (mn < 0 && mx > 0) {
+    ctx.strokeStyle = "#3a4653"; ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.moveTo(0, Y(0)); ctx.lineTo(w, Y(0)); ctx.stroke(); ctx.setLineDash([]);
+  }
+  /* 曲线：x 按已有帧数 count-1 拉伸铺满画布。
+   * 原按固定 N-1=1199 映射，刚连接的几十秒内所有点挤在左边缘几个像素，
+   * 视觉上等于"波形没显示" */
+  if (count === 0) {
+    ctx.font = "13px 'Microsoft YaHei',sans-serif";
+    if (rxBytes === 0) {
+      ctx.fillStyle = "#ff6b6b";
+      ctx.fillText("串口 0 字节：链路上没有数据（埠选错 / TX-RX 未交叉 / 波特率不符 / 固件未烧写或未运行）", 20, h / 2 - 8);
+    } else {
+      ctx.fillStyle = "#ffc94d";
+      ctx.fillText("已收到 " + rxBytes + " 字节，但没有任何一行是 10 段数字帧 → 看下方 HEX 面板里到底是什么", 20, h / 2 - 8);
+    }
+    ctx.fillStyle = "#8a97a6";
+    ctx.fillText("点「注入测试帧」可以脱机验证网页本身是否正常", 20, h / 2 + 14);
+  }
+  if (count > 1) {
+    ctx.strokeStyle = "#4da3ff"; ctx.lineWidth = 1.6; ctx.beginPath();
+    const start = count < N ? 0 : head;   // 从最旧样本开始画
+    for (let i = 0; i < count; i++) {
+      const v = data[(start + i) % N];
+      const x = i / (count - 1) * w, y = Y(v);
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+  /* 刻度文字 */
+  ctx.fillStyle = "#8a97a6"; ctx.font = "11px Consolas";
+  ctx.fillText(mx.toFixed(1), 4, 12);
+  ctx.fillText(mn.toFixed(1), 4, h - 4);
+  ctx.fillText(CH[curCh].name, w - 70, 12);
+}
+requestAnimationFrame(draw);
+
+/* 脱机自检：不接任何串口也能验证网页解析+绘图+增益面板是否正常。
+ * 注入后帧数会涨、波形会动 —— 说明网页没问题，故障在链路。 */
+el("btnInject").onclick = () => {
+  for (let k = 0; k < 240; k++) {
+    const t = k / 240 * Math.PI * 4;
+    const err = Math.round(6.5 * Math.sin(t));
+    const ahead = Math.round(6.5 * Math.sin(t + 0.35));
+    pushFrame([err, 180 * err, 0, 8 * (err - ahead),
+               1200 + err * 40, 1200 - err * 40, 0, 1800, 0, 80]);
+  }
+  addLog("已注入 240 帧测试数据（只验证网页，与真实串口无关）", "ack");
+};
+const chBox = el("chBtns");
+CH.forEach((c, i) => {
+  const b = document.createElement("button");
+  b.textContent = c.name;
+  if (i === 0) b.classList.add("on");
+  b.onclick = () => { curCh = i; chBox.querySelectorAll("button").forEach(x => x.classList.remove("on")); b.classList.add("on"); };
+  chBox.appendChild(b);
+});
+
+/* ================= 增益面板 ================= */
+document.querySelectorAll(".gain").forEach(g => {
+  const k = g.dataset.k, rng = g.querySelector("input[type=range]"),
+        num = g.querySelector("input[type=number]"), btn = g.querySelector("button");
+  rng.min = g.dataset.min; rng.max = g.dataset.max; rng.step = g.dataset.step;
+  rng.value = num.value = g.dataset.def;
+
+  function doSend(){
+    const v = parseFloat(num.value);
+    /* 拦截 NaN：固件 strtod("NaN") 能绕过范围校验，写进增益会把 PID 打炸 */
+    if (isNaN(v) || v < 0 || v > 1000) { addLog("数值无效，未发送", "err"); return; }
+    sendCmd(`${k}=${v}`);
+  }
+  /* 拖动/输入后 300ms 自动下发：原来只有点"发送"才发，
+   * 拖滑条看似调了参数，其实一个字节都没发出去 */
+  let timer = null;
+  const autoSend = () => { clearTimeout(timer); timer = setTimeout(doSend, 300); };
+
+  rng.oninput  = () => { num.value = rng.value; autoSend(); };
+  num.oninput  = () => { rng.value = num.value; autoSend(); };
+  btn.onclick  = doSend;
+});
+function setDevGain(k, v){
+  const g = document.querySelector(`.gain[data-k=${k}] .dev`);
+  if (g) g.textContent = `车端当前值：${v.toFixed(2)}`;
+}
+
+/* ================= 命令发送 ================= */
+let port = null, reader = null, writer = null, keepReading = false;
+async function sendCmd(s){
+  if (!writer) { addLog("(未连接，命令未发送) " + s, "err"); return; }
+  await writer.write(new TextEncoder().encode(s + "\r\n"));
+  addLog(">> " + s, "ack");
+}
+el("btnCmd").onclick = () => { const v = el("cmdIn").value.trim(); if (v) { sendCmd(v); el("cmdIn").value = ""; } };
+el("cmdIn").onkeydown = e => { if (e.key === "Enter") el("btnCmd").click(); };
+
+/* ================= 连接管理 ================= */
+el("btnConn").onclick = async () => {
+  if (port) { await disconnect(); return; }
+  try {
+    port = await navigator.serial.requestPort();
+    const info = port.getInfo ? port.getInfo() : {};
+    await port.open({ baudRate: parseInt(el("baud").value) });
+    writer = port.writable.getWriter();   /* 必须显式获取写锁，否则命令永远发不出去 */
+    el("btnConn").textContent = "断开"; el("btnConn").classList.add("warn");
+    el("btnConn").classList.remove("primary");
+    addLog(`已打开串口 ${el("baud").value} 8N1` +
+           (info.usbVendorId ? `（USB VID:PID = ${info.usbVendorId.toString(16)}:${(info.usbProductId||0).toString(16)}）` : "（虚拟串口，无 USB VID）"), "ack");
+    /* 2.5 秒无字节 = 链路级故障，直接报出来，不用再猜是解析问题 */
+    setTimeout(() => {
+      if (port && rxBytes === 0) {
+        addLog("❌ 2.5 秒内 0 字节：串口上没有任何数据。" +
+               "依次查 ①埠选的是蓝牙/USB-TTL 那个口吗（不是板载 XDS110 的 COM 口）" +
+               " ②模块 TXD 接 PB7、RXD 接 PB6（RX/TX 必须交叉）" +
+               " ③共地、模块供电" +
+               " ④波特率是否和模块一致（HC-05/06 出厂 9600）", "err");
+      } else if (port) {
+        addLog("收到 " + rxBytes + " 字节，链路正常", "ack");
+      }
+    }, 2500);
+    keepReading = true;
+    readLoop();
+  } catch (e) { port = null; writer = null; addLog("连接失败: " + e.message, "err"); }
+};
+async function disconnect(){
+  keepReading = false;
+  try { if (reader) await reader.cancel(); } catch (e) {}
+  try { if (writer) await writer.close(); } catch (e) {}
+  try { if (port) await port.close(); } catch (e) {}
+  port = reader = writer = null;
+  el("btnConn").textContent = "连接串口"; el("btnConn").classList.remove("warn");
+  el("btnConn").classList.add("primary");
+}
+async function readLoop(){
+  const dec = new TextDecoder("utf-8", {fatal: false});
+  while (port && keepReading) {
+    reader = port.readable.getReader();
+    try {
+      while (true) {
+        const {value, done} = await reader.read();
+        if (done) break;
+        if (value && value.length) noteRx(value);
+        feedText(dec.decode(value, {stream: true}));
+      }
+    } catch (e) { addLog("读取中断: " + e.message, "err"); }
+    finally { try { reader.releaseLock(); } catch (e) {} }
+    await new Promise(r => setTimeout(r, 100));
+  }
+}
+if (navigator.serial) {
+  navigator.serial.onconnect    = () => addLog("检测到串口设备热插拔", "ack");
+  navigator.serial.ondisconnect = () => { if (port) addLog("设备已拔出", "err"); };
+} else {
+  addLog("当前浏览器不支持 Web Serial，请用 Chrome / Edge", "err");
+}
+
+/* ================= 杂项 ================= */
+el("btnPause").onclick = function(){
+  paused = !paused;
+  this.textContent = paused ? "继续波形" : "暂停波形";
+};
+function el(id){ return document.getElementById(id); }
+function addLog(s, cls){
+  const box = el("log");
+  const d = document.createElement("div");
+  if (cls) d.className = cls;
+  d.textContent = new Date().toLocaleTimeString() + "  " + s;
+  box.appendChild(d);
+  while (box.children.length > 200) box.removeChild(box.firstChild);
+  box.scrollTop = box.scrollHeight;
+}
+</script>
+</body>
+</html>

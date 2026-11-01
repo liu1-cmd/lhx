@@ -1,0 +1,19 @@
+#include "Delay.h"
+
+#include "ti_msp_dl_config.h"
+
+void delay_ms(uint32_t ms)
+{
+    while(ms--)
+    {
+        delay_cycles(CPUCLK_FREQ / 1000);
+    }
+}
+
+void delay_us(uint32_t us)
+{
+    while(us--)
+    {
+        delay_cycles(CPUCLK_FREQ / 1000000);
+    }
+}
