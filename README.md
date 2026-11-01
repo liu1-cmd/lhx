@@ -1,41 +1,119 @@
-## Example Summary
+# MSPM0G3507 循迹小车
 
-Empty project using DriverLib.
-This example shows a basic empty project using DriverLib with just main file
-and SysConfig initialization.
+基于 TI **MSPM0G3507**（LP-MSPM0G3507 LaunchPad）+ MSPM0 SDK 2.04.00.06 的 8 路灰度循迹小车：
+PD 循迹、丢线原地找线、蓝牙遥控、蓝牙在线调参、100Hz 遥测。
 
-## Peripherals & Pin Assignments
+> 本仓库由 TI `empty` 示例工程改造而来，原始示例说明见 `README.html`。
 
-| Peripheral | Pin | Function |
+## 功能
+
+| 功能 | 说明 |
+| --- | --- |
+| PD 循迹 | 200Hz 控制环（SysTick 5ms），误差一阶低通 + 差速转向 |
+| 弯道自适应减速 | 误差每加一档降速 `SLOW_K`，最低 `BASE_MIN`；全白/全黑盲区限速 |
+| 丢线找线 | 连续全白 100ms → 原地转找线：去程 1.6s / 反向回扫 0.6s 循环，不会停死 |
+| 蓝牙遥控 | `f/b/l/r/x` 按住型指令，断流 800ms 自动停车；`mode=1/0` 切换遥控/循迹 |
+| 在线调参 | 串口下发 `kp= ki= kd= base= tau= oled= echo=`，掉电不保存 |
+| 遥测 | 115200 波特率，CSV 文本帧（VOFA+ FireWater 或自带网页） |
+| OLED 显示 | 传感器掩码、线误差、状态、当前模式（可在跑圈时关闭） |
+
+## 目录结构
+
+```
+888/
+├─ empty.c                 主程序：初始化 + SysTick 控制中断 + 主循环调度
+├─ empty.syscfg            SysConfig 配置（引脚、UART、PWM）
+├─ ti_msp_dl_config.[ch]   由 syscfg 生成的底层初始化
+├─ keil/                   Keil MDK 工程（推荐）
+│   ├─ empty_LP_MSPM0G3507_nortos_keil.uvprojx
+│   ├─ tracker.c/.h        循迹策略（RUN / PIVOT 两态）
+│   ├─ remote.c/.h         蓝牙遥控（与调参共用同一串口）
+│   ├─ tuner.c/.h          命令解析 + 遥测帧
+│   ├─ pid.c/.h            PID 控制器
+│   ├─ motor.c/.h          电机驱动（PWM + 方向脚，支持反转/刹车）
+│   ├─ linefollower.c/.h   8 路灰度读取与误差换算
+│   ├─ usart.c/.h          UART1 环形缓冲（收发均中断，不阻塞）
+│   ├─ OLED/               OLED 驱动（软件 I2C）
+│   └─ delay.c/.h          延时
+├─ iar/ gcc/ ticlang/      其它工具链工程（未重点验证）
+└─ 调参网页.html            Web Serial 调参台（Chrome/Edge，无需 VOFA+）
+```
+
+## 硬件连接
+
+| 功能 | 引脚 | 说明 |
 | --- | --- | --- |
-| SYSCTL |  |  |
-| DEBUGSS | PA20 | Debug Clock |
-| DEBUGSS | PA19 | Debug Data In Out |
+| 电机 A 方向 | PA0 / PA1 | IN1 / IN2 |
+| 电机 B 方向 | PB0 / PB1 | IN1 / IN2 |
+| 电机 PWM | PA8 / PA9 | TIMA0 CCP0 / CCP1，周期 3200 |
+| 灰度 X1…X8 | PA13 PA14 PA15 PA17 PA10 PA11 PB2 PB3 | 白=1 黑=0，bit7=X1 最左 … bit0=X8 最右 |
+| 串口 TX / RX | PB6 / PB7 | UART1，115200 8N1，接蓝牙模块或 USB-TTL |
+| OLED | PB11(SCL) / PB10(SDA) | 软件 I2C |
 
-## BoosterPacks, Board Resources & Jumper Settings
+灰度误差 `-7 ~ +7`（负=线偏左，正=线偏右），全白视为丢线（沿上次方向），全黑视为十字（误差归零）。
 
-Visit [LP_MSPM0G3507](https://www.ti.com/tool/LP-MSPM0G3507) for LaunchPad information, including user guide and hardware files.
+## 编译与下载
 
-| Pin | Peripheral | Function | LaunchPad Pin | LaunchPad Settings |
-| --- | --- | --- | --- | --- |
-| PA20 | DEBUGSS | SWCLK | N/A | <ul><li>PA20 is used by SWD during debugging<br><ul><li>`J101 15:16 ON` Connect to XDS-110 SWCLK while debugging<br><li>`J101 15:16 OFF` Disconnect from XDS-110 SWCLK if using pin in application</ul></ul> |
-| PA19 | DEBUGSS | SWDIO | N/A | <ul><li>PA19 is used by SWD during debugging<br><ul><li>`J101 13:14 ON` Connect to XDS-110 SWDIO while debugging<br><li>`J101 13:14 OFF` Disconnect from XDS-110 SWDIO if using pin in application</ul></ul> |
+1. 安装 Keil MDK（armclang）与 MSPM0 SDK 2.04.00.06；
+2. 打开 `keil/empty_LP_MSPM0G3507_nortos_keil.uvprojx`；
+3. Build（F7）→ Download（F8），或直接 Debug 运行。
 
-### Device Migration Recommendations
-This project was developed for a superset device included in the LP_MSPM0G3507 LaunchPad. Please
-visit the [CCS User's Guide](https://software-dl.ti.com/msp430/esd/MSPM0-SDK/latest/docs/english/tools/ccs_ide_guide/doc_guide/doc_guide-srcs/ccs_ide_guide.html#sysconfig-project-migration)
-for information about migrating to other MSPM0 devices.
+## 串口命令（一行一条，`\r\n` 结尾；手机 App 不发换行时，静默 50ms 也按一行处理）
 
-### Low-Power Recommendations
-TI recommends to terminate unused pins by setting the corresponding functions to
-GPIO and configure the pins to output low or input with internal
-pullup/pulldown resistor.
+### 循迹调参
 
-SysConfig allows developers to easily configure unused pins by selecting **Board**→**Configure Unused Pins**.
+| 命令 | 范围 | 说明 |
+| --- | --- | --- |
+| `kp=180` | 0~1000 | 比例增益，默认 180 |
+| `ki=0` | 0~1000 | 积分增益，默认 0（循迹一般不用 I） |
+| `kd=0.8` | 0~1000 | 微分增益，默认 0.8 |
+| `base=2200` | 500~3200 | 直线基础速度，弯道会按误差自动降速 |
+| `tau=0.01` | 0~0.5 秒 | 误差低通时间常数，0=关闭 |
+| `pivot=0/1` | — | 外侧探头压线直接原地转（默认 0，交给 PD 差速） |
+| `oled=0/1` | — | 关/开 OLED 刷新，跑圈时关掉更顺 |
+| `echo=0/1` | — | 关/开 ACK/ERR 回显（默认关，避免污染遥测数字流） |
 
-For more information about jumper configuration to achieve low-power using the
-MSPM0 LaunchPad, please visit the [LP-MSPM0G3507 User's Guide](https://www.ti.com/lit/slau873).
+### 蓝牙遥控（手机蓝牙串口 App 或网页）
 
-## Example Usage
+| 命令 | 说明 |
+| --- | --- |
+| `mode=1` / `m1` | 切到蓝牙遥控，**立即刹停**等指令 |
+| `mode=0` / `m0` | 切回自动循迹（速度从 0 软启动） |
+| `f` / `b` | 前进 / 后退（按住型：连续发就一直走） |
+| `l` / `r` | 左转（右轮正转左轮反转） / 右转 |
+| `x` | 停车 |
+| `spd=1200` | 遥控速度 300~3200，独立于循迹 `base` |
 
-Compile, load and run the example.
+`f/b/l/r` 断流超过 **800ms** 自动刹停，防止蓝牙掉线跑飞。同一字符连发（如 `ffff`）视为有效指令。
+
+## 遥测帧（车 → 上位机，100fps）
+
+每帧 11 个逗号分隔的整数、`\r\n` 结尾，放大 10 倍的通道需除以 10：
+
+| 通道 | 内容 |
+| --- | --- |
+| ch0 | 原始线误差 -7~+7（数字探头的台阶） |
+| ch1 | P 项 ×10 |
+| ch2 | 滤波后误差 ×10（连续量，与 ch0 对比看滤波效果） |
+| ch3 | D 项 ×10 |
+| ch4 / ch5 | dutyA / dutyB（带符号，负=反转） |
+| ch6 | 状态：0=循迹 1=原地找线 2=蓝牙遥控 |
+| ch7 / ch8 / ch9 | kp ×10 / ki ×10 / kd ×10（车端当前值） |
+| ch10 | 原始 8 位掩码 0~255（bit7=X1 最左） |
+
+## 网页调参台
+
+用 Chrome/Edge 打开 `调参网页.html` → “连接串口” 选 115200：
+
+- 实时波形：看 ch0 误差是否快速回零、过弯不振荡；
+- 滑杆改 Kp/Ki/Kd 后点“发送”，立即生效（下拉电丢失）；
+- 手动命令框可直接发 `base=1800`、`mode=1`、`f` 等；
+- “录制数据” 可导出 CSV 便于事后分析。
+
+整定建议：振荡 → 降 kp / 升 kd；回零慢 → 升 kp；D 毛刺大 → 降 kd 或调大 tau。
+
+## 已知限制
+
+- 锐角弯仍可能丢线（靠 PIVOT 扫回来），可通过降低探头高度、加宽黑线改善；
+- PID 增益只存在 RAM，复位后回到默认值；
+- `iar/ gcc/ ticlang/` 工程未随本次改动同步验证，请以 Keil 工程为准。
