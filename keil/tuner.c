@@ -146,7 +146,7 @@ static void handle_command(char *s)
         return;
     }
 
-    /* 外侧探头 pivot 触发开关："pivot=0/1"（0=关，默认；1=旧行为） */
+    /* 锐角弯 pivot 触发开关："pivot=0/1"（1=开，默认；0=关。检测到外探头+中间同时压线立即原地转） */
     if (sep - p == 5 && ci_eq(p[0], 'p') && ci_eq(p[1], 'i') &&
         ci_eq(p[2], 'v') && ci_eq(p[3], 'o') && ci_eq(p[4], 't')) {
         v = strtod(sep + 1, NULL);

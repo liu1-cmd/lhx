@@ -16,16 +16,31 @@
  * ================================================================== */
 
 /* ---------------- 可调参数 ---------------- */
-#define BASE_MAX      2200    /* 直线基础速度（3200 为满占空比），可用 base= 在线改 */
-#define BASE_MIN       700    /* 急弯最低速度 */
+#define BASE_MAX      1400    /* 直线基础速度（3200 为满占空比），可用 base= 在线改 */
+#define BASE_MIN       550    /* 急弯最低速度 */
 #define SLOW_K         150    /* 每档误差的减速量：err=±7 时降到 BASE_MIN */
-#define BLIND_SPEED   1100    /* 全白/全黑盲区限速：8 路都给不出误差，别全速冲 */
+#define BLIND_SPEED    850    /* 全白/全黑盲区限速：8 路都给不出误差，别全速冲 */
 
 #define LOST_LIMIT      20    /* 连续全白周期数(5ms×20=100ms) 才认为真丢线。
                                线常落进 X4/X5 死区，阈值太小会疯狂误触 pivot */
-#define PIVOT_SPEED   2400    /* 原地转单轮占空比：低电压/搓地阻力下也要转得动 */
+#define PIVOT_SPEED   1600    /* 原地转单轮占空比：50%。2400(75%) 太猛，先从中速试 */
 #define PIVOT_TIMEOUT  320    /* 首次朝一侧转 1.6s */
 #define PIVOT_RETRY    120    /* 反向回扫 0.6s：比去程短，形成净前进的扫掠 */
+
+/* 原地转的差速极性：+1 / -1。
+ * 这个符号只影响 pivot 的两个轮子谁正谁反，和 PD 的 dutyA/dutyB 无关。
+ * 台架上如果发现"该往左拧却往右拧"，把这里翻一下就行，不用动别处。 */
+#define PIVOT_SIGN     (-1)
+
+/* 锐角原地转的"看线"参数。车是绕线旋转的：拧到 90° 时新线正好压住中间两路，
+ * 再转下去线就从另一侧扫出去了，届时"看到线"就退会让车顺着原路反着走
+ * （一圈走成倒着跑）。所以窗口内也要盯，对准了就立刻收手。 */
+#define PIVOT_MIN_TURN   12   /* 先转 60ms 再认"对准"，防止进场那两拍就退 */
+#define PIVOT_ACUTE_MAX  80   /* 400ms 还对不准就放宽判据，别一直自转 */
+#define PIVOT_ACUTE_TURN 140  /* 锐角盲转硬上限 700ms：转够就强制交回 PD。
+                               * 锐角时原主线一直压在阵列里，反向回扫必然扫回
+                               * 原线 → 退出后车头对着来路 → 顺着原路倒着跑。
+                               * 所以锐角只朝一个方向转，绝不换向。 */
 
 #define CTRL_DT      0.005f   /* 控制周期，由 empty.c 的 SysTick 5ms 保证 */
 #define PID_LIMIT   2000.0f   /* PID 输出限幅 */
@@ -35,10 +50,16 @@
 #define SLEW_UP       60
 #define SLEW_DOWN    120
 
+
+
 /* LF_Read 位：bit7=X1(最左) ... bit0=X8(最右) */
 #define MASK_X1   0x80
 #define MASK_X8   0x01
 #define MASK_MID  0x18        /* X4 X5 中间两路 */
+#define MASK_L_OUT  0xC0u     /* X1 X2 左侧外探头 */
+#define MASK_R_OUT  0x03u     /* X7 X8 右侧外探头 */
+#define MASK_L_GAP  0x60u     /* X2 X3：X1 与 X4/X5 之间 */
+#define MASK_R_GAP  0x06u     /* X6 X7：X5 与 X8 之间 */
 
 /* ---------------- 在线可调参数 ---------------- */
 static float   g_kp = 180.0f;
@@ -46,7 +67,7 @@ static float   g_ki = 0.0f;
 static float   g_kd = 0.8f;
 static float   g_tau = 0.01f;      /* 误差一阶低通时间常数，0=关闭 */
 static int16_t g_base_max = BASE_MAX;
-static uint8_t g_outer_pivot = 0;  /* 最外侧探头压线是否直接 pivot，默认关 */
+static uint8_t g_outer_pivot = 1;  /* 锐角检测默认开，pivot=0 可在线关 */
 
 /* ---------------- 内部状态 ---------------- */
 typedef enum { ST_RUN = 0, ST_PIVOT = 1 } TrkState;
@@ -56,6 +77,11 @@ static TrkState state     = ST_RUN;
 static int8_t   last_side = 0;     /* 最近一次明确的偏离方向：-1 线在左, +1 线在右 */
 static int8_t   pivot_dir = 0;
 static uint8_t  pivot_back = 0;    /* 0=正在去程(1.6s) 1=正在回扫(0.6s) */
+static uint8_t  pivot_hold = 0;    /* 进入后强制盲转的周期数：锐角进弯时必须>0 */
+static uint8_t  pivot_need_mid = 0;/* 1=锐角进弯：线回到中间 X4/X5 才交回 PD，
+                                      外侧扫到就退会把弯放掉，转一半→丢线→再转 */
+static uint8_t  mid_ok    = 0;     /* 锐角盲转窗内"对准新线"连续成立的拍数 */
+static uint8_t  pivot_acute = 0;   /* 1=本次 pivot 由锐角检测触发：只朝一个方向转，禁止反向回扫 */
 static uint16_t lost_cnt  = 0;
 static uint16_t pivot_cnt = 0;
 static uint8_t  outer_cnt = 0;
@@ -89,13 +115,24 @@ static int16_t base_slew(int16_t target)
     return base_ramp;
 }
 
-/* 进入 PIVOT：朝最后看到线的方向转 */
-static void pivot_enter(int8_t dir)
+/* 进入 PIVOT：朝最后看到线的方向转
+ * hold：进入后强制盲转的周期数（5ms/周期）。
+ *   丢线进入填 0 —— 此时 line 全白，靠"任意探头见线"退出没有问题；
+ *   锐角进入必须填几十拍 —— 此时 line 本来就非 0，
+ *   不盲转就会在同一拍被判成"已经找到线"立刻退出，pivot 等于没做。
+ * need_mid：1=只有中间 X4/X5 见线才退出（锐角进弯用），
+ *   否则支线刚从外侧探头扫进来就交回 PD，锐角永远转不完。 */
+static void pivot_enter(int8_t dir, uint8_t hold, uint8_t need_mid,
+                        uint8_t acute)
 {
-    state      = ST_PIVOT;
-    pivot_dir  = dir;
-    pivot_back = 0;
-    pivot_cnt  = 0;
+    state          = ST_PIVOT;
+    pivot_dir      = dir;
+    pivot_back     = 0;
+    pivot_cnt      = 0;
+    pivot_hold     = hold;
+    pivot_need_mid = need_mid;
+    pivot_acute    = acute;
+    mid_ok         = 0;
     pid_reset();
 }
 
@@ -105,6 +142,10 @@ static void pivot_exit(int8_t err)
     state     = ST_RUN;
     lost_cnt  = 0;
     pivot_cnt = 0;
+    pivot_hold = 0;
+    pivot_need_mid = 0;
+    mid_ok = 0;
+    pivot_acute = 0;
     base_ramp = BASE_MIN;
     pid_reset();
     steer.last_err = (float)err;
@@ -121,6 +162,9 @@ void Tracker_Resume(void)
     pivot_back = 0;
     lost_cnt  = 0;
     pivot_cnt = 0;
+    pivot_hold = 0;
+    pivot_need_mid = 0;
+    pivot_acute = 0;
     outer_cnt = 0;
     base_ramp = 0;
     err_f     = 0.0f;
@@ -178,6 +222,9 @@ void Tracker_Init(void)
     pivot_back = 0;
     lost_cnt   = 0;
     pivot_cnt  = 0;
+    pivot_hold = 0;
+    pivot_need_mid = 0;
+    pivot_acute = 0;
     outer_cnt  = 0;
     cur_err    = 0;
     cur_line   = 0;
@@ -213,18 +260,34 @@ void Tracker_Update(int16_t *dutyA, int16_t *dutyB)
         /* 2. 连续全白 = 真丢线 → 原地找线 */
         if (line == 0x00) {
             if (++lost_cnt >= LOST_LIMIT) {
-                pivot_enter((last_side != 0) ? last_side : -1);
+                pivot_enter((last_side != 0) ? last_side : -1, 0, 0, 0);
             }
         } else {
             lost_cnt = 0;
         }
 
-        /* 3. 可选：最外侧探头压线就是直角/锐角（中间两路没压，排除宽线误判），
-         *    连续 4 个周期(20ms) 才触发，防颠簸误动作。默认关闭，交给 PD 打满差速。 */
-        if (g_outer_pivot && state == ST_RUN && line != 0xFF &&
-            (line & (MASK_X1 | MASK_X8)) && !(line & MASK_MID)) {
-            if (++outer_cnt >= 4) {
-                pivot_enter((line & MASK_X1) ? -1 : 1);
+        /* 3. 锐角直接 pivot（pivot=0 可关）：一侧最外探头(X1/X8)压线、
+         *    中间 X4/X5 也压线、对侧外探头没压 —— 说明进弯直线和出弯支线
+         *    同时在阵列下，是锐角/发夹特征。旧判据要求 X3/X6 必须熄灭
+         *    （精确 1245/4578），实际进弯常扫成 12345/124，永不触发。
+         *    连续 4 拍才信。 */
+        if (g_outer_pivot && line != 0xFF) {
+            /* 必须是"两段线"：最外探头亮、中间也亮、且两者之间至少灭一路。
+             * 一段粗线/斜线也能扫出 0xF8(X1..X5) 这种连片图案，只看"外+中"
+             * 会把它当成发夹去转，而车本来正跟着这条线走 —— 实测 40 次
+             * pivot 里大半是这种误判，转完就丢线。 */
+            uint8_t acute_l = (line & MASK_X1) && (line & MASK_MID) &&
+                              !(line & MASK_R_OUT) &&
+                              ((line & MASK_L_GAP) != MASK_L_GAP);
+            uint8_t acute_r = (line & MASK_X8) && (line & MASK_MID) &&
+                              !(line & MASK_L_OUT) &&
+                              ((line & MASK_R_GAP) != MASK_R_GAP);
+            if (acute_l || acute_r) {
+                if (++outer_cnt >= 4) {
+                    pivot_enter(acute_l ? -1 : 1, 30, 1, 1); /* 150ms 兜底；线一对准就提前退 */
+                    outer_cnt = 0;
+                }
+            } else {
                 outer_cnt = 0;
             }
         } else {
@@ -247,36 +310,109 @@ void Tracker_Update(int16_t *dutyA, int16_t *dutyB)
             if (out >  (float)base) out =  (float)base;
             if (out < -(float)base) out = -(float)base;
 
-            /* 差速极性：X1 侧=A 轮，X8 侧=B 轮；out>0 → A 慢 B 快，车拧向 B 侧。
-             * 下面的 pivot 用同一套约定，改一处就要两处一起改。 */
+            /* 差速极性（台架实测）：A 轮=物理左=X1 侧，B 轮=物理右=X8 侧；
+             * 车头永远朝慢轮一侧拧。out>0(线在右) → B 慢 A 快 → 向右拧向线。 */
             *dutyA = (int16_t)(base - (int16_t)out);
             *dutyB = (int16_t)(base + (int16_t)out);
         }
     }
 
     if (state == ST_PIVOT) {
-        if (line != 0x00) {
-            /* 任意探头见线就交回 PD。转圈时线往往先扫到外侧探头，
-             * 等中间两路会把时间白耗掉。 */
+        uint8_t exited   = 0;
+        /* 对准判据：中间两路都压着、外侧四路全灭 —— 车头正对新线 */
+        uint8_t lined_up = ((line & MASK_MID) == MASK_MID) &&
+                           !(line & (MASK_L_OUT | MASK_R_OUT));
+        /* 线在中间区：X4/X5 压住任意一路、外侧四路全灭。
+         * 细线常只压中间一路，丢线退出用这个稍宽判据 */
+        uint8_t mid_zone = (line & MASK_MID) &&
+                           !(line & (MASK_L_OUT | MASK_R_OUT));
+
+        if (pivot_hold) {
+            /* 锐角进弯的盲转窗。窗口里 line 本来就非 0，不能拿"看到线"当退出
+             * 条件（进弯当拍就会退，等于没转）；但也不能死等到窗口结束：车是
+             * 绕线旋转的，拧过 90° 后新线会从另一侧扫回中间，那时再退就是顺着
+             * 原路反着走了。所以这里盯"对准"，立刻收手。 */
+            if (pivot_need_mid && pivot_cnt >= PIVOT_MIN_TURN && lined_up) {
+                if (++mid_ok >= 2) {
+                    pivot_exit(err);
+                    *dutyA = BASE_MIN;
+                    *dutyB = BASE_MIN;
+                    exited = 1;
+                }
+            } else {
+                mid_ok = 0;
+            }
+            if (!exited) pivot_hold--;
+        } else if (pivot_need_mid) {
+            /* 锐角盲转窗用完还没对准：必须"外侧全灭 + 中间见线"连续 2 拍才退。
+             * 不能用"中间任一路亮"——进弯时原主线本来就压着 X4/X5，
+             * 那条判据会让车原地没转就退出，方向没变，PD 只能沿原线走。 */
+            if (pivot_cnt >= PIVOT_MIN_TURN && mid_zone) {
+                if (++mid_ok >= 2) {
+                    pivot_exit(err);
+                    *dutyA = BASE_MIN;
+                    *dutyB = BASE_MIN;
+                    exited = 1;
+                }
+            } else {
+                mid_ok = 0;
+            }
+        } else if (pivot_cnt >= PIVOT_MIN_TURN && mid_zone) {
+            /* 丢线进入：线回到中间区才退。旧判据"任意探头见线就退"会在
+             * 车转过 135°、身后旧线扫进外侧探头时退出 → 顺着原路倒着跑。 */
+            if (++mid_ok >= 2) {
+                pivot_exit(err);
+                *dutyA = BASE_MIN;
+                *dutyB = BASE_MIN;
+                exited = 1;
+            }
+        } else if (pivot_back && line != 0x00) {
+            /* 已经反向回扫还没对准线：不再苛求居中，任意见线即退，
+             * 保证扫掠总能闭环，不会原地无限自转 */
+            mid_ok = 0;
             pivot_exit(err);
             *dutyA = BASE_MIN;
             *dutyB = BASE_MIN;
+            exited = 1;
         } else {
+            mid_ok = 0;
+        }
+
+        if (!exited && pivot_acute && pivot_cnt >= PIVOT_ACUTE_TURN) {
+            /* 锐角转够硬上限还没对到新线：直接交回 PD，让 PD 自己收尾。
+             * 绝不换向回扫——原主线一直在视野里，反向必扫回原线，
+             * 退出后车头对着来路，就成了"倒着跑"。 */
+            pivot_exit(err);
+            *dutyA = BASE_MIN;
+            *dutyB = BASE_MIN;
+            exited = 1;
+        }
+
+        if (!exited) {
             /* 去程 1.6s 找不到 → 反向回扫 0.6s → 再朝原方向 1.6s……
              * 每轮净转 1s，一圈圈扫过去总能扫到线，且不会停下来。 */
             uint16_t limit = pivot_back ? PIVOT_RETRY : PIVOT_TIMEOUT;
+            /* 对准判据太苛刻时（线粗、斜着扫进来压 3 路），400ms 还没对准就
+             * 放宽成"任意中间路见线"，别原地一直自转 */
+            if (pivot_need_mid && pivot_cnt >= PIVOT_ACUTE_MAX) {
+                pivot_need_mid = 0;
+                mid_ok = 0;
+            }
             if (++pivot_cnt >= limit) {
                 pivot_cnt  = 0;
                 pivot_back = pivot_back ? 0 : 1;
                 pivot_dir  = (int8_t)(-pivot_dir);
+                /* 换向说明原方向扫了 1.6s 都没把线带回中间，
+                 * 放弃"必须居中"的苛刻退出，改回任意见线即退兜底 */
+                pivot_need_mid = 0;
                 pid_reset();
             }
-            if (pivot_dir < 0) {          /* dir<0：朝 X1 侧拧 → A 反转 B 正转 */
-                *dutyA = -PIVOT_SPEED;
-                *dutyB =  PIVOT_SPEED;
-            } else {
-                *dutyA =  PIVOT_SPEED;
-                *dutyB = -PIVOT_SPEED;
+            if (pivot_dir < 0) {          /* dir<0：线在 X1/左侧 → 车头朝左拧 */
+                *dutyA = (int16_t)( PIVOT_SIGN * PIVOT_SPEED);
+                *dutyB = (int16_t)(-PIVOT_SIGN * PIVOT_SPEED);
+            } else {                      /* dir>0：线在 X8/右侧 → 车头朝右拧 */
+                *dutyA = (int16_t)(-PIVOT_SIGN * PIVOT_SPEED);
+                *dutyB = (int16_t)( PIVOT_SIGN * PIVOT_SPEED);
             }
         }
     }
